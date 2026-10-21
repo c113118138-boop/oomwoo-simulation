@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""
+ROS2 Bridge Node for SangamIO Vacuum Robot
+
+This node bridges between SangamIO (running on the vacuum) and ROS2.
+
+Published topics:
+  /scan (sensor_msgs/LaserScan) - LiDAR scan at ~5Hz
+  /imu (sensor_msgs/Imu) - IMU data at ~110Hz
+  /odom (nav_msgs/Odometry) - Wheel odometry at ~110Hz
+  /battery (sensor_msgs/BatteryState) - Battery status
+  /bumper (vacuum_ros2_bridge/Bumper) - Bumper sensors
+  /cliff (vacuum_ros2_bridge/Cliff) - Cliff sensors
+  /vacuum_status (vacuum_ros2_bridge/VacuumStatus) - General status
+
+Subscribed topics:
+  /cmd_vel (geometry_msgs/Twist) - Velocity commands
+  /actuator_cmd (vacuum_ros2_bridge/ActuatorCommand) - Actuator control
+  /led_cmd (vacuum_ros2_bridge/LedCommand) - LED control
+
+Services:
+  /set_actuator (vacuum_ros2_bridge/SetActuator) - Set actuator speed
+  /set_led (vacuum_ros2_bridge/SetLed) - Set LED state
+  /set_lidar (vacuum_ros2_bridge/SetLidar) - Enable/disable LiDAR
+"""
+
+import math
+import rclpy
+from rclpy.node import Node
+from rclpy.duration import Duration
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rcl_interfaces.msg import ParameterDescriptor
+
+from std_msgs.msg import Header
+from sensor_msgs.msg import LaserScan, Imu, BatteryState
+from geometry_msgs.msg import Twist, Quaternion, Vector3, TransformStamped
+from nav_msgs.msg import Odometry
+from tf2_ros import TransformBroadcaster
+
+# Custom messages (will be available after building)
+from vacuum_ros2_bridge.msg import Bumper, Cliff, VacuumStatus, ActuatorCommand, LedCommand
+from vacuum_ros2_bridge.srv import SetActuator, SetLed, SetLidar
+
+# SangamIO client
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from vacuum_ros2_bridge.sangamio_client import SangamIOClient, SensorData
+
+
+class VacuumBridgeNode(Node):
+    """ROS2 bridge node for SangamIO vacuum robot."""
+
+    # Drive/IMU geometry used until the robot advertises its own via the
+    # SangamIO `kinematics` group (older SangamIO builds never do). These are
+    # the CRL-200S (Proscenic M6 Pro) values.
+    DEFAULT_KINEMATICS = {
+        'wheel_m_per_tick': 1.0 / 4464.0,  # encoder ticks -> meters
+        'wheel_track_m': 0.233,  # distance between wheels
+        'wheel_tick_bits': 16,  # encoder counters wrap at 2^bits
+        'gyro_rad_per_lsb': math.radians(0.01025),  # GD32 reports ~0.01 deg/s
+        'accel_mps2_per_lsb': 2.0 * 9.81 / 32768.0,  # 2 g over int16
+    }
+
+    def __init__(self):
+        super().__init__('vacuum_bridge')
+
+        # Declare parameters
+        self.declare_parameter('robot_ip', '192.168.1.143')
+        self.declare_parameter('robot_port', 5555)
+        self.declare_parameter('frame_id', 'base_link')
+        self.declare_parameter('odom_frame_id', 'odom')
+        self.declare_parameter('lidar_frame_id', 'laser')
+        self.declare_parameter('publish_tf', False)
+        # Seconds added to each /scan stamp. The LiDAR data is older than the
+        # moment we publish it (sensor + transport + assembly delay), so a small
+        # NEGATIVE value back-dates the scan to when it was actually measured and
+        # stops points from lagging the robot during rotation. Calibrate per robot.
+        self.declare_parameter('scan_time_offset', 0.0)
+        # Fixed-pattern-noise mask: 'min1,max1,min2,max2,...' in degrees. Those
+        # LiDAR angle bins are dropped (set to inf) -- e.g. the enclosure posts
+        # around the puck that return a constant false point. Ranges may wrap 0.
+        self.declare_parameter('scan_mask_deg', '')
+        # Per-parameter overrides of the robot's advertised kinematics (e.g.
+        # after calibrating wheel scale). 0 = use the robot's value.
+        for key in self.DEFAULT_KINEMATICS:
+            self.declare_parameter(
+                key, 0.0, ParameterDescriptor(dynamic_typing=True))
+
+        # Get parameters
+        robot_ip = self.get_parameter('robot_ip').value
+        robot_port = self.get_parameter('robot_port').value
+        self.frame_id = self.get_parameter('frame_id').value
+        self.odom_frame_id = self.get_parameter('odom_frame_id').value
+        self.lidar_frame_id = self.get_parameter('lidar_frame_id').value
+        self.publish_tf = self.get_parameter('publish_tf').value
+        self.scan_time_offset = self.get_parameter('scan_time_offset').value
+        self.scan_masked = self._build_scan_mask(
+            self.get_parameter('scan_mask_deg').value)
+        self.kinematics_overrides = {
+            key: float(self.get_parameter(key).value)
+            for key in self.DEFAULT_KINEMATICS
+            if float(self.get_parameter(key).value) > 0.0}
+        self.robot_kinematics = None  # last `kinematics` group from SangamIO
+        self._apply_kinematics({})
+
+        # SangamIO client
+        self.client = SangamIOClient(robot_ip, robot_port)
+        self.client.on_sensor_update(self._on_sensor_update)
+        self.client.on_lidar_scan(self._on_lidar_scan)
+        self.client.on_kinematics(self._on_kinematics)
+
+        # QoS profiles. Use RELIABLE so the topics are compatible with the
+        # default (reliable) subscribers in the Kaia.ai stack (cartographer,
+        # nav2, RViz, robot_localization EKF). A reliable publisher also serves
+        # best-effort subscribers, so this is the most compatible choice.
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
+        # Publishers
+        self.scan_pub = self.create_publisher(LaserScan, '/scan', sensor_qos)
+        self.imu_pub = self.create_publisher(Imu, '/imu', sensor_qos)
+        self.odom_pub = self.create_publisher(Odometry, '/odom', sensor_qos)
+        self.battery_pub = self.create_publisher(BatteryState, '/battery', 10)
+        self.bumper_pub = self.create_publisher(Bumper, '/bumper', sensor_qos)
+        self.cliff_pub = self.create_publisher(Cliff, '/cliff', sensor_qos)
+        self.status_pub = self.create_publisher(VacuumStatus, '/vacuum_status', 10)
+
+        # Optional odom -> base TF broadcaster. Off by default: when the
+        # robot_localization EKF runs, it owns the odom -> base_footprint
+        # transform. Enable (publish_tf:=true) to broadcast it straight from
+        # wheel odometry instead -- no EKF in the graph (e.g. while IMU fusion
+        # is on hold, or for simpler debugging).
+        self.tf_broadcaster = TransformBroadcaster(self) if self.publish_tf else None
+
+        # Subscribers
+        self.cmd_vel_sub = self.create_subscription(
+            Twist, '/cmd_vel', self._cmd_vel_callback, 10)
+        self.actuator_sub = self.create_subscription(
+            ActuatorCommand, '/actuator_cmd', self._actuator_callback, 10)
+        self.led_sub = self.create_subscription(
+            LedCommand, '/led_cmd', self._led_callback, 10)
+
+        # Services
+        self.set_actuator_srv = self.create_service(
+            SetActuator, '/set_actuator', self._set_actuator_callback)
+        self.set_led_srv = self.create_service(
+            SetLed, '/set_led', self._set_led_callback)
+        self.set_lidar_srv = self.create_service(
+            SetLidar, '/set_lidar', self._set_lidar_callback)
+
+        # Odometry state
+        self.last_left_ticks = None
+        self.last_right_ticks = None
+        self.x = 0.0
+        self.y = 0.0
+        self.theta = 0.0
+        self.last_odom_time = None
+
+        # LiDAR scan timing: measure the real rotation period from the interval
+        # between consecutive full scans, rather than assuming a fixed 5 Hz.
+        self.last_scan_time = None
+        self.scan_period = 0.2  # seconds; seeded at ~5 Hz, updated from measurement
+
+        # Start the self-healing connection (connects + auto-reconnects with
+        # backoff on close, and re-registers if the UDP telemetry stalls).
+        self.client.on_status(self._on_conn_status)
+        self.get_logger().info(
+            f'Connecting to SangamIO at {robot_ip}:{robot_port} (auto-reconnect)...')
+        self.client.start()
+
+    def _on_conn_status(self, connected: bool):
+        """Connection-status callback from the client worker thread."""
+        if connected:
+            self.get_logger().info('Connected to SangamIO')
+        else:
+            self.get_logger().warn('Disconnected from SangamIO; reconnecting...')
+
+    def _on_sensor_update(self, topic: str, data: SensorData):
+        """Handle sensor data update from SangamIO."""
+        now = self.get_clock().now().to_msg()
+
+        # Publish IMU
+        self._publish_imu(data, now)
+
+        # Publish odometry
+        self._publish_odom(data, now)
+
+        # Publish bumper
+        self._publish_bumper(data, now)
+
+        # Publish cliff
+        self._publish_cliff(data, now)
+
+        # Publish battery (at lower rate)
+        self._publish_battery(data, now)
+
+        # Publish vacuum status
+        self._publish_status(data, now)
+
+    def _apply_kinematics(self, advertised: dict):
+        """Resolve each kinematics value: ROS parameter override, else the
+        robot's advertised value, else the CRL-200S default. An absent
+        accel_mps2_per_lsb from a robot that advertises kinematics means its
+        accelerometer scale is unknown, so acceleration is not published."""
+        k = dict(self.DEFAULT_KINEMATICS)
+        if advertised:
+            k['accel_mps2_per_lsb'] = None
+        for key, value in advertised.items():
+            if key in k and isinstance(value, (int, float)) and value > 0:
+                k[key] = float(value)
+        k.update(self.kinematics_overrides)
+        self.wheel_m_per_tick = k['wheel_m_per_tick']
+        self.wheel_track_m = k['wheel_track_m']
+        self.tick_modulus = 1 << int(k['wheel_tick_bits'])
+        self.gyro_scale = k['gyro_rad_per_lsb']
+        self.accel_scale = k['accel_mps2_per_lsb']
+        return k
+
+    def _on_kinematics(self, values: dict):
+        """Handle the robot's `kinematics` group (resent every few seconds)."""
+        advertised = {key: values[key] for key in self.DEFAULT_KINEMATICS
+                      if key in values}
+        if advertised == self.robot_kinematics:
+            return
+        self.robot_kinematics = advertised
+        k = self._apply_kinematics(advertised)
+        # Re-baseline odometry so ticks read under the old scale or counter
+        # width are not differenced under the new one.
+        self.last_left_ticks = None
+        self.last_right_ticks = None
+        self.get_logger().info(
+            'Robot kinematics: '
+            + ', '.join(f'{key}={k[key]}' for key in self.DEFAULT_KINEMATICS)
+            + (f' (overridden: {sorted(self.kinematics_overrides)})'
+               if self.kinematics_overrides else ''))
+
+    def _build_scan_mask(self, spec: str):
+        """Parse 'min1,max1,min2,max2,...' (degrees) into a 360-entry bool mask of
+        LiDAR bins to drop (fixed-pattern noise, e.g. enclosure posts). A range may
+        wrap past 0 (e.g. '355,5' masks 355..359 and 0..5)."""
+        masked = [False] * 360
+        try:
+            nums = [float(x) for x in str(spec).split(',') if x.strip() != '']
+        except ValueError:
+            self.get_logger().warn(f"Bad scan_mask_deg '{spec}'; ignoring")
+            return masked
+        pairs = list(zip(nums[0::2], nums[1::2]))
+        for lo, hi in pairs:
+            lo_i, hi_i = int(math.floor(lo)), int(math.ceil(hi))
+            bins = (range(lo_i, hi_i + 1) if lo <= hi
+                    else list(range(lo_i, 360)) + list(range(0, hi_i + 1)))
+            for i in bins:
+                masked[i % 360] = True
+        if pairs:
+            self.get_logger().info(
+                f"Scan angle mask {pairs} deg -> {sum(masked)} bins excluded")
+        return masked
+
+    def _on_lidar_scan(self, points: list, rpm: float):
+        """Handle LiDAR scan from SangamIO."""
+        if not points:
+            return
+
+        now_time = self.get_clock().now()
+        now = now_time.to_msg()
+
+        # Measure the real scan period from the interval between full scans.
+        # The LiDAR RPM (and thus scan rate) is not guaranteed to be exactly 5 Hz,
+        # and reporting the true period lets cartographer deskew correctly.
+        if self.last_scan_time is not None:
+            dt = (now_time - self.last_scan_time).nanoseconds / 1e9
+            if 0.02 < dt < 2.0:  # ignore startup gaps / outliers
+                self.scan_period = dt
+        self.last_scan_time = now_time
+
+        msg = LaserScan()
+        # Back-date (or advance) the scan to when it was actually measured.
+        msg.header.stamp = (now_time + Duration(seconds=self.scan_time_offset)).to_msg()
+        msg.header.frame_id = self.lidar_frame_id
+
+        # LiDAR parameters
+        msg.angle_min = 0.0
+        msg.angle_increment = 2.0 * math.pi / 360  # ~1 degree
+        # LaserScan endpoints are inclusive. With 360 one-degree bins, the
+        # last sample is at 359 degrees rather than the duplicated 360 degrees.
+        msg.angle_max = msg.angle_min + 359 * msg.angle_increment
+        msg.scan_time = self.scan_period  # measured rotation period
+        msg.time_increment = self.scan_period / 360.0  # per-bin time over one revolution
+        msg.range_min = 0.15  # 15 cm
+        msg.range_max = 8.0  # 8 m
+
+        # Initialize ranges array with inf (no return)
+        ranges = [float('inf')] * 360
+        intensities = [0.0] * 360
+
+        # Fill in actual measurements
+        for point in points:
+            # Convert angle to index (0-359)
+            angle_deg = math.degrees(point.angle_rad) % 360
+            idx = int(angle_deg) % 360
+
+            # Drop fixed-pattern-noise bins (left as inf / no return)
+            if self.scan_masked[idx]:
+                continue
+
+            # Only update if this is a valid measurement
+            if 0 < point.distance_m < msg.range_max:
+                ranges[idx] = point.distance_m
+                intensities[idx] = float(point.quality)
+
+        msg.ranges = ranges
+        msg.intensities = intensities
+
+        self.scan_pub.publish(msg)
+
+    def _publish_imu(self, data: SensorData, stamp):
+        """Publish IMU message."""
+        msg = Imu()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.frame_id
+
+        # Angular velocity (rad/s) from raw counts, per the robot's kinematics
+        msg.angular_velocity.x = data.gyro_x * self.gyro_scale
+        msg.angular_velocity.y = data.gyro_y * self.gyro_scale
+        msg.angular_velocity.z = data.gyro_z * self.gyro_scale
+
+        # Linear acceleration (m/s^2); -1 covariance marks it as not provided
+        # when the robot's accelerometer scale is unknown.
+        if self.accel_scale:
+            msg.linear_acceleration.x = data.accel_x * self.accel_scale
+            msg.linear_acceleration.y = data.accel_y * self.accel_scale
+            msg.linear_acceleration.z = data.accel_z * self.accel_scale
+            msg.linear_acceleration_covariance[0] = 0.1
+        else:
+            msg.linear_acceleration_covariance[0] = -1.0
+
+        # Covariance (unknown, use -1)
+        msg.orientation_covariance[0] = -1.0
+        msg.angular_velocity_covariance[0] = 0.01
+
+        self.imu_pub.publish(msg)
+
+    def _publish_odom(self, data: SensorData, stamp):
+        """Publish odometry message from wheel encoders."""
+        left_ticks = data.wheel_left
+        right_ticks = data.wheel_right
+
+        if self.last_left_ticks is None:
+            self.last_left_ticks = left_ticks
+            self.last_right_ticks = right_ticks
+            self.last_odom_time = self.get_clock().now()
+            return
+
+        # Handle tick counter wraparound (2^wheel_tick_bits)
+        modulus = self.tick_modulus
+
+        def tick_diff(new, old):
+            diff = (new - old) % modulus
+            if diff >= modulus // 2:
+                diff -= modulus
+            return diff
+
+        dl = tick_diff(left_ticks, self.last_left_ticks) * self.wheel_m_per_tick
+        dr = tick_diff(right_ticks, self.last_right_ticks) * self.wheel_m_per_tick
+
+        self.last_left_ticks = left_ticks
+        self.last_right_ticks = right_ticks
+
+        # Compute odometry
+        d = (dl + dr) / 2.0
+        dtheta = (dr - dl) / self.wheel_track_m
+
+        # Update pose
+        self.x += d * math.cos(self.theta + dtheta / 2.0)
+        self.y += d * math.sin(self.theta + dtheta / 2.0)
+        self.theta += dtheta
+
+        # Normalize theta to [-pi, pi]
+        while self.theta > math.pi:
+            self.theta -= 2.0 * math.pi
+        while self.theta < -math.pi:
+            self.theta += 2.0 * math.pi
+
+        # Compute velocities
+        now = self.get_clock().now()
+        if self.last_odom_time:
+            dt = (now - self.last_odom_time).nanoseconds / 1e9
+            if dt > 0:
+                vx = d / dt
+                vth = dtheta / dt
+            else:
+                vx = vth = 0.0
+        else:
+            vx = vth = 0.0
+        self.last_odom_time = now
+
+        # Build message
+        msg = Odometry()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.odom_frame_id
+        msg.child_frame_id = self.frame_id
+
+        # Position
+        msg.pose.pose.position.x = self.x
+        msg.pose.pose.position.y = self.y
+        msg.pose.pose.position.z = 0.0
+
+        # Orientation (quaternion from yaw)
+        msg.pose.pose.orientation = self._yaw_to_quaternion(self.theta)
+
+        # Velocity
+        msg.twist.twist.linear.x = vx
+        msg.twist.twist.angular.z = vth
+
+        # Covariance (simple diagonal)
+        msg.pose.covariance[0] = 0.01  # x
+        msg.pose.covariance[7] = 0.01  # y
+        msg.pose.covariance[35] = 0.01  # yaw
+        msg.twist.covariance[0] = 0.01  # vx
+        msg.twist.covariance[35] = 0.01  # vth
+
+        self.odom_pub.publish(msg)
+
+        # Broadcast odom -> base TF from the same pose (when no EKF is running).
+        if self.tf_broadcaster is not None:
+            t = TransformStamped()
+            t.header.stamp = stamp
+            t.header.frame_id = self.odom_frame_id
+            t.child_frame_id = self.frame_id
+            t.transform.translation.x = self.x
+            t.transform.translation.y = self.y
+            t.transform.translation.z = 0.0
+            t.transform.rotation = msg.pose.pose.orientation
+            self.tf_broadcaster.sendTransform(t)
+
+    def _publish_bumper(self, data: SensorData, stamp):
+        """Publish bumper message."""
+        msg = Bumper()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.frame_id
+        msg.left = data.bumper_left
+        msg.right = data.bumper_right
+        self.bumper_pub.publish(msg)
+
+    def _publish_cliff(self, data: SensorData, stamp):
+        """Publish cliff message."""
+        msg = Cliff()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.frame_id
+        msg.left_side = data.cliff_left_side
+        msg.left_front = data.cliff_left_front
+        msg.right_front = data.cliff_right_front
+        msg.right_side = data.cliff_right_side
+        self.cliff_pub.publish(msg)
+
+    def _publish_battery(self, data: SensorData, stamp):
+        """Publish battery state."""
+        msg = BatteryState()
+        msg.header.stamp = stamp
+        msg.voltage = data.battery_voltage
+        msg.percentage = data.battery_percent / 100.0
+        msg.power_supply_status = (
+            BatteryState.POWER_SUPPLY_STATUS_CHARGING if data.is_charging
+            else BatteryState.POWER_SUPPLY_STATUS_DISCHARGING
+        )
+        msg.present = True
+        self.battery_pub.publish(msg)
+
+    def _publish_status(self, data: SensorData, stamp):
+        """Publish vacuum status."""
+        msg = VacuumStatus()
+        msg.header.stamp = stamp
+        msg.battery_voltage = data.battery_voltage
+        msg.battery_percent = data.battery_percent
+        msg.is_charging = data.is_charging
+        msg.is_docked = data.is_docked
+        msg.dustbox_attached = data.dustbox_attached
+        msg.water_tank_level = data.water_tank_level
+        msg.start_button_pressed = data.start_button
+        msg.dock_button_pressed = data.dock_button
+        self.status_pub.publish(msg)
+
+    def _cmd_vel_callback(self, msg: Twist):
+        """Handle velocity command."""
+        self.client.set_velocity(msg.linear.x, msg.angular.z)
+
+    def _actuator_callback(self, msg: ActuatorCommand):
+        """Handle actuator command."""
+        component = msg.component.lower()
+        speed = msg.speed
+
+        if component == 'vacuum':
+            self.client.set_vacuum(speed)
+        elif component == 'main_brush':
+            self.client.set_main_brush(speed)
+        elif component == 'side_brush':
+            self.client.set_side_brush(speed)
+        elif component == 'water_pump':
+            self.client.set_water_pump(speed)
+        else:
+            self.get_logger().warn(f'Unknown actuator: {component}')
+
+    def _led_callback(self, msg: LedCommand):
+        """Handle LED command."""
+        self.client.set_led(msg.state)
+
+    def _set_actuator_callback(self, request, response):
+        """Handle set_actuator service."""
+        component = request.component.lower()
+        speed = request.speed
+
+        success = False
+        if component == 'vacuum':
+            success = self.client.set_vacuum(speed)
+        elif component == 'main_brush':
+            success = self.client.set_main_brush(speed)
+        elif component == 'side_brush':
+            success = self.client.set_side_brush(speed)
+        elif component == 'water_pump':
+            success = self.client.set_water_pump(speed)
+        else:
+            response.success = False
+            response.message = f'Unknown actuator: {component}'
+            return response
+
+        response.success = success
+        response.message = 'OK' if success else 'Failed to send command'
+        return response
+
+    def _set_led_callback(self, request, response):
+        """Handle set_led service."""
+        success = self.client.set_led(request.state)
+        response.success = success
+        response.message = 'OK' if success else 'Failed to send command'
+        return response
+
+    def _set_lidar_callback(self, request, response):
+        """Handle set_lidar service."""
+        success = self.client.set_lidar(request.enable)
+        response.success = success
+        response.message = 'OK' if success else 'Failed to send command'
+        return response
+
+    @staticmethod
+    def _yaw_to_quaternion(yaw: float) -> Quaternion:
+        """Convert yaw angle to quaternion."""
+        q = Quaternion()
+        q.x = 0.0
+        q.y = 0.0
+        q.z = math.sin(yaw / 2.0)
+        q.w = math.cos(yaw / 2.0)
+        return q
+
+    def destroy_node(self):
+        """Clean up on shutdown."""
+        self.client.disconnect()
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VacuumBridgeNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

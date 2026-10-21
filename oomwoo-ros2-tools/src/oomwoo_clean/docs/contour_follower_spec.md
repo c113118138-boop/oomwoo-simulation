@@ -1,0 +1,249 @@
+# Contour follower — design spec (draft)
+
+Status: draft for review. Implementation not started.
+
+## 1. Purpose & scope
+
+A reactive behavior that traces the boundary of a **LiDAR-visible** obstacle of
+**any continuous shape** — concave *and* convex — at a fixed standoff, so the
+vacuum cleans the edge strip all the way around it. It is the LiDAR
+generalization of `wall_clean` (which only follows walls/concave corners *by
+bumper contact*): proactive, arbitrary-shape, off the LiDAR.
+
+It stays in the **reactive layer**: `/scan` → `/cmd_vel`, no global plan. Sibling
+to `wall_clean`; publishes `cleaning_active` so `coverage_meter` scores it.
+
+**In scope:** the *follow primitive* only.
+**Out of scope (higher layers, later):** choosing which obstacle to clean next
+and driving to it (a sequencer / `clean_to_goal` does that), free-area
+boustrophedon fill, and get-unstuck.
+
+## 2. Behavior / state machine
+
+- **IDLE** — waiting for a start trigger.
+- **ALIGN** — turn in place until the obstacle is abeam on the follow side (right)
+  and the robot is roughly tangent to it. Entered after the higher layer has
+  parked the robot near the obstacle.
+- **FOLLOW** — the control loop: hold standoff and trace the contour (turn *in* on
+  concave, arc *around* on convex).
+- **CLOSE** — loop closure detected (returned to the start pose) → stop, report
+  `~/done`.
+- **LOST** — boundary lost and not re-acquired within the convex-arc recovery →
+  stop and report (safety).
+
+## 3. The control law (the crux)
+
+Follow side = **right** (configurable). Convention: obstacle on the right, robot
+circles it keeping it on the right. Frame: 0° = forward, −90° = right, CCW +.
+
+### 3.1 Boundary extraction (per scan)
+- Look at a **follow-side, forward-biased sector**, e.g. bearings β ∈ [−170°, +20°]
+  (right + front, for look-ahead).
+- **Nearest boundary point** P: seed on the beam with the minimum range in that
+  sector, then **fit a circle** to a short window of the contiguous surface around
+  it (`fit_window_m`, broken at range discontinuities by `fit_gap_m`), and take
+  `(d, β)` from the fitted curve — the distance from the robot to it and the
+  bearing of its nearest point. Below `min_fit_points` the raw seed beam is used.
+- Fitting is not optional polish. At a 0.2 m standoff a ±20° swing along a wall
+  changes the range by 1.3 cm, against ~2 cm of beam scatter, so the *arg*-min
+  beam is essentially random and `min()` over the beams is a biased distance —
+  measured ±7–8° of bearing noise, which the controller turns into a visible
+  weave. Median-filtering the scan barely helps (±6°): the flat minimum is the
+  problem, not the outliers.
+- The circle, rather than a line, is what makes it shape-general. Its curvature
+  term goes to zero on a flat wall, so it reproduces a line fit there (±0.8°),
+  but it also tracks round obstacles a line cannot (±0.4° on a 15 cm stool seat,
+  ±1.1° on a 3 cm leg, where a line fit gives ±15°).
+- The window must stay **short** (0.15 m) and local to the seed. Fitting the whole
+  visible surface smears an inside corner into one tilted line and turns the robot
+  ~0.8 m early; a 0.15 m window holds the wall to ±0.8° until the front wall is
+  0.22 m away, then hands over.
+- Ignore beams beyond `max_follow_range` so "nearest boundary" is *this* obstacle,
+  not a far background wall.
+
+### 3.2 Two error terms
+- **Standoff error** `e_d = d_body − standoff` (positive = too far from the obstacle),
+  where `d_body` is the distance from the **body centre** to the fitted curve, not
+  the LiDAR's range. The LiDAR sits `body_offset_m` (0.0745 m) ahead of the wheel
+  axle, so in a turn the shell swings wide of where the LiDAR points. Servoing the
+  raw range measured 0.169 m at a wall's tip and 0.174 m at a box corner against a
+  0.1745 m body radius — contact. The fitted conic is just a curve in the scan
+  frame, so the body centre is another point to evaluate it at; with no fit, the
+  seed beam is treated as perpendicular, giving `d + offset·cos(bearing)`. Running
+  parallel to a wall the two measures are identical, so wall following is unchanged
+  by construction; they separate only in turns, which is where the grazing was.
+- **Bearing error** `e_β = β_min − β_ref`, with `β_ref = −90°` (abeam) for a
+  tangent path; a small forward lead may be added.
+
+### 3.3 Command
+A **cascade**, not one summed law. The outer loop turns standoff error into a
+desired **approach angle**, capped at `alpha_max_deg` (40°); the inner loop steers
+the robot onto that angle:
+
+    α   = clamp(k_approach · e_d, ±α_max)      # how far to angle in/out
+    e_h = α − e_β                              # inner (heading) error
+    ω   = clamp(−k_heading · e_h, ±ω_max)
+
+- Forward speed `v = v_nominal`, eased toward `v_min` by the **inner** error
+  `|e_h|` (not `e_β`): a large bearing error is exactly what a legitimate far
+  approach looks like, and keying the ease-off to it made the robot crawl in at
+  the speed floor instead of closing.
+- On curves this law settles slightly outward: with the bearing taken at the LiDAR
+  (0.0745 m ahead of the body centre) the offset geometry and the proportional lag
+  nearly cancel, leaving +0.6 cm on a 2 cm leg and +1.7 cm in an R 0.35 bay. The
+  textbook correction (body-centre bearing + curvature feed-forward,
+  `use_body_bearing` / `use_curvature_ff`) was built and measured: gentle bays
+  land on target, but the tight bay goes into the wall. Both stay off.
+- The point guard (§3.2's "never further than the Nth-nearest point") carries a
+  noise margin: without one the 3rd-nearest of ~60 noisy points beat the unbiased
+  fit on every smooth surface and held the robot 9.9 mm out along every straight
+  wall. The margin is `point_guard_noise_k` (1.0) times the range noise
+  ESTIMATED FROM EACH SCAN (median absolute second difference of neighbouring
+  ranges), not a fixed length, because noise depends on the LiDAR, the surface and
+  the light. Wall offset the guard adds at 0.5 / 1 / 2 cm noise: fixed 1 cm margin
+  0.0 / 1.4 / 13.5 mm, median-9 filter 0.8 / 1.9 / 6.3 mm, estimated 0.3 / 1.0 /
+  4.7 mm. The estimate is printed in the log line (`noise 9.8 mm`).
+- Do **not** cap `v` by curvature to buy clearance in turns. Tried and measured
+  worse: the turn rate comes from the bearing error, so cutting `v` shrinks the
+  path radius `v/ω` and the robot spirals *in* — around a 2 cm leg, clearance fell
+  from 0.182 m to 0.083 m. The clearance fix is geometric (§3.2), not kinematic.
+- This one law covers **straight** (both errors ≈ 0), **concave** (P swings forward
+  and closes → turn away, follow the inside corner), and the *onset* of **convex**
+  (P swings behind abeam → turn toward, begin to arc).
+
+### 3.4 Convex corner — the make-or-break
+- **Failure mode:** at an outside corner the obstacle ends and `d_min` jumps to a
+  far/background reading → a naive law reads "obstacle far" → drives straight off
+  the corner.
+- **Guard + recovery:** if `d_min` jumps by > `convex_jump_m` between frames, *or*
+  no boundary within `max_follow_range` remains in the sector → enter a **bounded
+  arc**: command a fixed curvature *toward* the follow side (turn right) at radius
+  ≈ `convex_arc_radius`, sweeping around where the corner was until a near boundary
+  reappears in the sector (then resume FOLLOW). Cap it: if the arc sweeps past
+  `convex_arc_max_deg` (~200°) without re-acquiring, the obstacle really ended →
+  **LOST**.
+- This "lose the wall → curve toward it" is the classic convex behavior; the arc
+  radius comes from the standoff so the robot rounds the corner at the right
+  offset. **This is the behavior our bumper `wall_clean` cannot do, and the reason
+  the follower exists.**
+
+## 4. Standoff geometry
+
+- `standoff` = the perpendicular **body-centre**-to-boundary distance we hold
+  (measured abeam, −90°; see §3.2). For a wall parallel to heading this equals the
+  LiDAR's own perpendicular distance — the fore/aft mount position doesn't change
+  it — so the two only differ in turns.
+- Constraints:
+  1. `standoff ≥ lidar_min_range` (0.1 m) so the boundary is sensable.
+  2. **Body clearance:** the body is a disk of radius `base_diameter/2 = 0.1745 m`;
+     its rightmost point is 0.1745 m off center, so `standoff > 0.1745 + gap`.
+  3. The **side brush** (extends a few cm past the body) should reach the edge
+     strip.
+- **Value: 0.23 m.** (Since then the bumper has been made flush with the body, so
+  the robot is a plain circle of 0.1745 m and every margin below grows by 7 mm.)
+  What touches first is not the body but the bumper, then a ring of
+  10 mm facets centred on the body radius whose corners reached **0.1814 m**. At the
+  original 0.20 m that left under 2 cm, and a Gazebo run halted on a bump just
+  after a concave corner with the body centre 0.18 m from the wall. Swept on the
+  test harness (worst margin to the bumper, across room, box, wall end, legs,
+  corridor): 0.20 m → **−1.1 mm, two contacts**; 0.21 → +6.8; 0.22 → +19.9;
+  **0.23 → +28.9 mm**; 0.24 → +37.2. Gazebo dipped ~13 mm deeper than the harness
+  at that corner, so 0.23 is the smallest value with real headroom. It costs edge
+  cleaning — a 5.5 cm body-to-wall gap instead of 2.5 cm — which the side brush
+  has to cover.
+- The **forward LiDAR** (mounted +0.0745 m) doesn't change straight-wall standoff,
+  but its abeam/forward reading is taken ahead of center → natural look-ahead on
+  the followed side, so a convex corner enters the sector sooner. That head start
+  is exactly what the mount move buys (measured in §9 test 5).
+
+## 5. Loop closure / termination
+
+- On entering FOLLOW, record the **start pose** `S = (x, y, θ)` from the
+  `map→base_footprint` TF (the existing localization stack).
+- Track traveled distance and **net heading change**.
+- **CLOSE** when: traveled > `min_loop_dist` AND back within `close_radius` of `S`
+  AND `|net heading change| ≈ 360°`. The heading-change gate distinguishes a real
+  full loop from merely re-crossing `S`.
+- Works for both a **free-standing obstacle** (chair → clockwise loop) and the
+  **room boundary** (walls → CCW loop) — both are closed loops.
+- On CLOSE, publish `~/done` (obstacle circumnavigated) for the sequencer.
+
+## 6. Interfaces
+
+**Subscribes**
+- `/scan` `sensor_msgs/LaserScan` (SensorData QoS) — the boundary.
+- TF `map→base_footprint` — pose, for loop closure.
+- `bumper_left/contact`, `bumper_right/contact` `ros_gz_interfaces/Contacts` —
+  safety: a bump during FOLLOW → back out (reuse `wall_clean`) then resume.
+
+**Publishes**
+- `cmd_vel` `geometry_msgs/Twist`.
+- `cleaning_active` `std_msgs/Bool` (latched) — for `coverage_meter`.
+- `~/state` `std_msgs/String` (IDLE/ALIGN/FOLLOW/CLOSE/LOST) — observability.
+- `~/done` `std_msgs/Empty` (edge, on CLOSE) — for the sequencer.
+
+**Control**
+- `~/start` service/topic (optional `follow_side`) — begin ALIGN → FOLLOW. Called
+  by the higher layer once the robot is parked near the obstacle.
+- Live ROS params (retunable while running, like `wall_clean`).
+
+## 7. Parameters (starting values, all live)
+
+| param | start | note |
+|---|---|---|
+| `follow_side` | right | |
+| `standoff_m` | 0.20 | perpendicular LiDAR-to-wall |
+| `v_nominal` / `v_min` | 0.15 / 0.05 | m/s |
+| `sector_min_deg` / `sector_max_deg` | -170 / 20 | follow-side + forward |
+| `max_follow_range_m` | 1.0 | ignore background beyond |
+| `bearing_ref_deg` | -90 | abeam (+ optional lead) |
+| `k_dist`, `k_bearing` | tune | control gains |
+| `convex_jump_m` | 0.30 | `d_min` jump that triggers the arc |
+| `convex_arc_radius_m` | 0.30 | ≈ standoff + body offset |
+| `convex_arc_max_deg` | 200 | give up → LOST |
+| `close_radius_m` | 0.15 | loop-closure return radius |
+| `min_loop_dist_m` | 0.5 | before closure can trigger |
+| `heading_close_deg` | 300 | net-heading gate for a full loop |
+
+## 8. Integration / handoff
+
+- **Sequencer (later):** navigates to a seed near the next uncleaned obstacle
+  (reuse `clean_to_goal` / Nav2), calls `~/start`; on `~/done`, picks the next;
+  when all obstacles are circled, hands to the free-area boustrophedon planner.
+- **Bump reflex:** a bumper hit on a LiDAR-invisible object during FOLLOW → back
+  out (`wall_clean` logic) and resume FOLLOW on the bumped contour (v1); unify the
+  two behaviors into one primitive later.
+- **Coverage:** `cleaning_active` drives `coverage_meter`, as today.
+
+## 9. Acceptance tests (in sim)
+
+1. **Straight wall** — standoff held within tolerance, no oscillation.
+2. **Concave inside corner** — turns in, no collision.
+3. **Convex outside corner** (spawn a box via `spawn_obstacle.launch.py`) — arcs
+   around, re-acquires, no fly-off. **Primary test.**
+4. **Free-standing obstacle** (box / chair model) — full lap, loop closes, `~/done`
+   fires once.
+5. **LiDAR mount A/B** — run test 3 with `lidar_center_offset` = 0.0 vs 0.0745 and
+   measure how much sooner the arc initiates / how cleanly the corner is rounded.
+   Quantifies what the forward mount buys.
+
+Metrics: min body-to-obstacle clearance (no scrape), standoff RMS on straights,
+corner success rate.
+
+## 10. Build phases
+
+1. **FOLLOW loop** — straight + concave (nearest-point law), standoff holding.
+2. **Convex** — arc guard/recovery + LOST.
+3. **Loop closure** — start-pose tracking, `~/done`, and the ALIGN entry.
+4. **Integration** — sequencer seam (`clean_to_goal`), bump handoff. *(later)*
+
+## Open questions
+
+- **Peninsula / divider obstacles** that merge into the room boundary (the follow
+  would transition onto the room wall). Out of scope for v1; the sequencer must
+  later recognize it.
+- Exact **standoff** for edge-strip coverage with the side brush (tune in sim).
+- **Goto-seed**: reuse Nav2 (`clean_to_goal`) or a simpler reactive drive?
+- **Side-distance-sensor ablation**: the model already carries L/R single-ray
+  sensors — after LiDAR-only works, fuse the side sensor for tighter close-in
+  offset and measure the delta (per the earlier plan: baseline, then ablation).
