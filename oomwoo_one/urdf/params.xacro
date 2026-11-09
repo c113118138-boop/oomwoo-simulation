@@ -168,7 +168,7 @@
   <xacro:property name="camera_hfov_deg" value="120.0"/>
   <xacro:property name="camera_vfov_deg"
     value="${2 * degrees(atan(tan(radians(camera_hfov_deg) / 2) * camera_height / camera_width))}"/>
-  <xacro:property name="camera_pitch_deg" value="${90.0 - camera_vfov_deg / 2}"/> <!-- down; bottom edge vertical -->
+  <xacro:property name="camera_pitch_deg" value="0.0"/> <!-- down; bottom edge vertical -->
   <xacro:property name="camera_near" value="0.02"/>                <!-- m -->
   <xacro:property name="camera_far" value="10.0"/>                 <!-- m -->
   <xacro:property name="camera_update_rate" value="15"/>           <!-- Hz -->
